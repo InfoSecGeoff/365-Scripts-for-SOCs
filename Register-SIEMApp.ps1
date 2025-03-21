@@ -1,6 +1,4 @@
 Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All", "Directory.ReadWrite.All"
-
-# Create new application
 $appName = "SIEMAPP"
 $appHomePageUrl = "https://yoururlhere.com"
 $appSignInAudience = "AzureADMyOrg" # Single tenant
@@ -16,13 +14,12 @@ $appRegistration = New-MgApplication -DisplayName $appName -SignInAudience $appS
 
 Write-Host "Application created with ID: $($appRegistration.Id)" -ForegroundColor Green
 
-# Create a service principal
 Write-Host "Creating service principal..." -ForegroundColor Cyan
 $servicePrincipal = New-MgServicePrincipal -AppId $appRegistration.AppId -Tags @("WindowsAzureActiveDirectoryIntegratedApp")
 
 Write-Host "Service principal created with ID: $($servicePrincipal.Id)" -ForegroundColor Green
 
-# Helper function to add required resource access to the application
+# Add required resource access to the application
 function Add-RequiredResourceAccess {
     param (
         [Parameter(Mandatory = $true)]
@@ -38,11 +35,11 @@ function Add-RequiredResourceAccess {
         [string]$AccessType
     )
     
-    # Get current required resource access
+
     $application = Get-MgApplication -ApplicationId $ApplicationId
     $requiredResourceAccess = $application.RequiredResourceAccess
     
-    # Check if the resource is already in the collection
+
     $resourceAccess = $requiredResourceAccess | Where-Object { $_.ResourceAppId -eq $ResourceAppId }
     
     if ($null -eq $resourceAccess) {
@@ -71,7 +68,6 @@ function Add-RequiredResourceAccess {
     Update-MgApplication -ApplicationId $ApplicationId -RequiredResourceAccess $requiredResourceAccess
 }
 
-# Configure delegated permissions
 $delegatedPermissions = @(
     @{
         ResourceAppId = "00000003-0000-0000-c000-000000000000" # Microsoft Graph
@@ -85,29 +81,19 @@ foreach ($permission in $delegatedPermissions) {
     
     foreach ($scope in $permission.Scopes) {
         Write-Host "  Adding delegated permission: $scope from $($resourceServicePrincipal.DisplayName)" -ForegroundColor Yellow
-        
-        # Add required resources access for delegated permissions
+
         $permissionId = $resourceServicePrincipal.OAuth2PermissionScopes | Where-Object { $_.Value -eq $scope } | Select-Object -ExpandProperty Id
         
         if ($null -ne $permissionId) {
-            # Add to the app's required resource access
             Add-RequiredResourceAccess -ApplicationId $appRegistration.Id -ResourceAppId $permission.ResourceAppId -AccessId $permissionId -AccessType "Scope"
-            
-            # Grant admin consent for delegated permissions
-            # Use try-catch to handle all potential errors
             try {
-                # Fixed: Don't try to filter on scope, just get all grants and filter client-side
                 $params = @{
                     ClientId = $servicePrincipal.Id
                     ConsentType = "AllPrincipals"
                     ResourceId = $resourceServicePrincipal.Id
                     Scope = $scope
                 }
-                
-                # Add delay to allow propagation
                 Start-Sleep -Seconds 2
-                
-                # Try to create the permission grant - if it fails with "already exists" that's fine
                 try {
                     New-MgOauth2PermissionGrant @params | Out-Null
                     Write-Host "    Admin consent granted for $scope" -ForegroundColor Green
@@ -128,7 +114,6 @@ foreach ($permission in $delegatedPermissions) {
 }
 
 # Add Office 365 Management API delegated permission manually
-# Note: We'll handle this differently since the discovery via API may not be working correctly
 Write-Host "  Adding delegated permission: Subscription.Read.All from Office 365 Management APIs" -ForegroundColor Yellow
 
 try {
@@ -137,16 +122,11 @@ try {
     
     if ($null -ne $o365ManagementAPI) {
         # Find the Subscription.Read.All permission ID
-        # Note: If API discovery doesn't work, we'll use a hardcoded ID that corresponds to this permission
-        $permId = "570282fd-fa5c-430d-a7fd-fc8dc98a9daa" # This ID may need to be verified
-        
-        # Add to required resource access
+        $permId = "5f88184c-80bb-4d52-9ff2-757288b2e9b7" 
         Add-RequiredResourceAccess -ApplicationId $appRegistration.Id -ResourceAppId $o365ManagementAPI.AppId -AccessId $permId -AccessType "Scope"
-        
-        # Add delay to allow propagation
+    
         Start-Sleep -Seconds 2
         
-        # Grant admin consent - simplified approach to avoid filtering issues
         try {
             $params = @{
                 ClientId = $servicePrincipal.Id
@@ -209,21 +189,16 @@ foreach ($permission in $applicationPermissions) {
     foreach ($permName in $permission.Permissions) {
         Write-Host "  Adding application permission: $permName from $($resourceServicePrincipal.DisplayName)" -ForegroundColor Yellow
         
-        # Find the app role ID for the permission
         $appRole = $resourceServicePrincipal.AppRoles | Where-Object { $_.Value -eq $permName }
         
         if ($null -ne $appRole) {
-            # Add to the app's required resource access
             Add-RequiredResourceAccess -ApplicationId $appRegistration.Id -ResourceAppId $permission.ResourceAppId -AccessId $appRole.Id -AccessType "Role"
-            
-            # Add delay to allow propagation
             Start-Sleep -Seconds 2
             
             # Assign app role to service principal (admin consent)
             try {
-                # Check if the app role assignment already exists - using a more reliable approach
                 try {
-                    # Try to create the assignment - if it fails with "already exists" that's fine
+
                     New-MgServicePrincipalAppRoleAssignment `
                         -ServicePrincipalId $servicePrincipal.Id `
                         -PrincipalId $servicePrincipal.Id `
@@ -232,7 +207,6 @@ foreach ($permission in $applicationPermissions) {
                     
                     Write-Host "    Admin consent granted for $permName" -ForegroundColor Green
                 } catch {
-                    # Check if the error is because the assignment already exists
                     if ($_.Exception.Message -like "*already assigned*" -or 
                         $_.Exception.Message -like "*already exists*" -or 
                         $_.Exception.Message -like "*duplicate*") {
