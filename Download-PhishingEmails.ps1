@@ -37,6 +37,11 @@
 .PARAMETER DaysBack
     Number of days to search backwards from today. Default: 30
 
+.PARAMETER IncludeRecoverableItems
+    Switch to include searches in the Recoverable Items folder (soft-deleted and hard-deleted emails).
+    Searches both RecoverableItemsDeletions (user-recoverable) and RecoverableItemsPurges (admin-only recoverable) folders.
+    Requires Mail.ReadWrite.All permissions and Single Item Recovery to be enabled on the mailbox.
+
 .EXAMPLE
     .\Download-PhishingEmail.ps1 -AppKeysCSV ".\AzureAppKeys.csv" -SubjectKeyword "Invoice" -ClientName "Acme Corp" -UserPrincipalName "victim@acmecorp.com"
     
@@ -52,9 +57,15 @@
     
     Downloads urgent payment phishing emails to a specific case folder.
 
+.EXAMPLE
+    .\Download-PhishingEmail.ps1 -AppKeysCSV ".\AzureAppKeys.csv" -SubjectKeyword "Invoice" -ClientName "Acme Corp" -UserPrincipalName "victim@acmecorp.com" -IncludeRecoverableItems
+    
+    Downloads emails including soft-deleted and hard-deleted items from the Recoverable Items folder (dumpster).
+
 .NOTES
     Author: Geoff Tankersley
-    Version: 2.0
+    Version: 2.1
+    Modified: Added -IncludeRecoverableItems parameter for searching deleted items
     Requirements:
     - Azure App Registration with Mail.Read.All and Mail.ReadWrite.All delegated permissions. Most SIEMs will already have an Azure App generated for Unified Audit Log monitoring.
     - PowerShell 5.1 or later
@@ -96,7 +107,10 @@ param(
     [int]$MaxResults = 50,
     
     [Parameter(Mandatory=$false)]
-    [int]$DaysBack = 30
+    [int]$DaysBack = 30,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$IncludeRecoverableItems
 )
 
 # Load app credentials from CSV
@@ -231,34 +245,38 @@ function Invoke-GraphAPI {
     }
 }
 
-# Search for emails
-function Search-Emails {
+# Search for emails in a specific folder
+function Search-EmailsInFolder {
     param(
         [string]$AccessToken,
         [string]$UserEmail,
         [string]$Subject,
         [int]$Days,
-        [int]$Limit
+        [int]$Limit,
+        [string]$FolderPath = "",
+        [string]$FolderName = "Mailbox"
     )
     
     try {
-        Write-Host "Searching mailbox: $UserEmail" -ForegroundColor Cyan
-        Write-Host "Subject contains: '$Subject'" -ForegroundColor Cyan
-        Write-Host "Looking back $Days days from today (since $(((Get-Date).AddDays(-$Days)).ToString('yyyy-MM-dd')))" -ForegroundColor Cyan
+        Write-Host "  Searching $FolderName..." -ForegroundColor Cyan
         
-        # First, get recent messages without complex filtering
-        $endpoint = "/users/$UserEmail/messages"
-        $endpoint += "?`$top=1000"  # Get more messages to filter locally
+        # Build endpoint based on folder
+        if ([string]::IsNullOrEmpty($FolderPath)) {
+            $endpoint = "/users/$UserEmail/messages"
+        } else {
+            $endpoint = "/users/$UserEmail/MailFolders/$FolderPath/messages"
+        }
+        
+        $endpoint += "?`$top=1000"
         $endpoint += "&`$select=id,subject,sender,receivedDateTime,bodyPreview,hasAttachments,internetMessageId"
         $endpoint += "&`$orderby=receivedDateTime desc"
         
-        Write-Host "Getting recent messages..." -ForegroundColor Yellow
-        Write-Host "API Endpoint: $endpoint" -ForegroundColor Gray
+        Write-Host "    API Endpoint: $endpoint" -ForegroundColor Gray
         
         $response = Invoke-GraphAPI -AccessToken $AccessToken -Endpoint $endpoint
         
         if ($response -and $response.value) {
-            Write-Host "Retrieved $($response.value.Count) recent messages, filtering locally..." -ForegroundColor Yellow
+            Write-Host "    Retrieved $($response.value.Count) recent messages from $FolderName, filtering locally..." -ForegroundColor Yellow
             
             # Filter locally by subject and date
             $cutoffDate = (Get-Date).AddDays(-$Days)
@@ -270,6 +288,8 @@ function Search-Emails {
                     
                     # Check if message is within date range and subject matches
                     if ($messageDate -ge $cutoffDate -and $message.subject -like "*$Subject*") {
+                        # Add a property to track which folder this came from
+                        $message | Add-Member -MemberType NoteProperty -Name "SourceFolder" -Value $FolderName -Force
                         $filteredMessages += $message
                     }
                     
@@ -284,14 +304,101 @@ function Search-Emails {
             }
             
             if ($filteredMessages.Count -gt 0) {
-                Write-Host "Found $($filteredMessages.Count) matching messages" -ForegroundColor Green
+                Write-Host "    Found $($filteredMessages.Count) matching messages in $FolderName" -ForegroundColor Green
                 return $filteredMessages
             } else {
-                Write-Host "No messages found matching criteria after filtering" -ForegroundColor Yellow
-                return $null
+                Write-Host "    No messages found matching criteria in $FolderName" -ForegroundColor Yellow
+                return @()
             }
         } else {
-            Write-Host "No messages retrieved from mailbox" -ForegroundColor Yellow
+            Write-Host "    No messages retrieved from $FolderName" -ForegroundColor Yellow
+            return @()
+        }
+    }
+    catch {
+        Write-Error "Error searching emails in $FolderName`: $_"
+        return @()
+    }
+}
+
+# Search for emails (combines regular and recoverable items if requested)
+function Search-Emails {
+    param(
+        [string]$AccessToken,
+        [string]$UserEmail,
+        [string]$Subject,
+        [int]$Days,
+        [int]$Limit,
+        [bool]$SearchRecoverable = $false
+    )
+    
+    try {
+        Write-Host "Searching mailbox: $UserEmail" -ForegroundColor Cyan
+        Write-Host "Subject contains: '$Subject'" -ForegroundColor Cyan
+        Write-Host "Looking back $Days days from today (since $(((Get-Date).AddDays(-$Days)).ToString('yyyy-MM-dd')))" -ForegroundColor Cyan
+        if ($SearchRecoverable) {
+            Write-Host "Including Recoverable Items (soft-deleted and hard-deleted emails)" -ForegroundColor Cyan
+        }
+        
+        $allMessages = @()
+        
+        # Search regular mailbox folders
+        Write-Host "`n[1/3] Searching regular mailbox folders..." -ForegroundColor Yellow
+        $regularMessages = Search-EmailsInFolder -AccessToken $AccessToken -UserEmail $UserEmail -Subject $Subject -Days $Days -Limit $Limit -FolderPath "" -FolderName "Regular Mailbox"
+        $allMessages += $regularMessages
+        
+        # Search Recoverable Items if requested
+        if ($SearchRecoverable) {
+            # Search RecoverableItemsDeletions (soft-deleted, user-recoverable)
+            Write-Host "`n[2/3] Searching RecoverableItemsDeletions (soft-deleted, user-recoverable)..." -ForegroundColor Yellow
+            try {
+                $softDeletedMessages = Search-EmailsInFolder -AccessToken $AccessToken -UserEmail $UserEmail -Subject $Subject -Days $Days -Limit $Limit -FolderPath "RecoverableItemsDeletions" -FolderName "RecoverableItemsDeletions (Soft-Deleted)"
+                $allMessages += $softDeletedMessages
+            }
+            catch {
+                Write-Warning "Could not access RecoverableItemsDeletions folder. Single Item Recovery may not be enabled or insufficient permissions. Error: $_"
+            }
+            
+            # Search RecoverableItemsPurges (hard-deleted, admin-only recoverable)
+            Write-Host "`n[3/3] Searching RecoverableItemsPurges (hard-deleted, admin-only)..." -ForegroundColor Yellow
+            try {
+                $hardDeletedMessages = Search-EmailsInFolder -AccessToken $AccessToken -UserEmail $UserEmail -Subject $Subject -Days $Days -Limit $Limit -FolderPath "RecoverableItemsPurges" -FolderName "RecoverableItemsPurges (Hard-Deleted)"
+                $allMessages += $hardDeletedMessages
+            }
+            catch {
+                Write-Warning "Could not access RecoverableItemsPurges folder. Single Item Recovery may not be enabled or insufficient permissions. Error: $_"
+            }
+        } else {
+            Write-Host "`nNote: Use -IncludeRecoverableItems to search soft-deleted and hard-deleted emails" -ForegroundColor Gray
+        }
+        
+        # Remove duplicates based on internetMessageId
+        if ($allMessages.Count -gt 0) {
+            $uniqueMessages = $allMessages | Group-Object -Property internetMessageId | ForEach-Object {
+                # If duplicates exist, prefer the one from regular mailbox, then soft-deleted, then hard-deleted
+                $_.Group | Sort-Object -Property @{Expression={
+                    switch ($_.SourceFolder) {
+                        "Regular Mailbox" { 1 }
+                        "RecoverableItemsDeletions (Soft-Deleted)" { 2 }
+                        "RecoverableItemsPurges (Hard-Deleted)" { 3 }
+                        default { 4 }
+                    }
+                }} | Select-Object -First 1
+            }
+            
+            Write-Host "`n=== SEARCH SUMMARY ===" -ForegroundColor Cyan
+            Write-Host "Total messages found (before deduplication): $($allMessages.Count)" -ForegroundColor White
+            Write-Host "Unique messages found: $($uniqueMessages.Count)" -ForegroundColor Green
+            
+            # Show breakdown by folder
+            $folderBreakdown = $allMessages | Group-Object -Property SourceFolder
+            foreach ($folder in $folderBreakdown) {
+                Write-Host "  - $($folder.Name): $($folder.Count)" -ForegroundColor Cyan
+            }
+            
+            return $uniqueMessages
+        } else {
+            Write-Host "`nNo messages found matching criteria" -ForegroundColor Yellow
             return $null
         }
     }
@@ -501,6 +608,7 @@ function Download-Emails {
             if ($fullMessage) {
                 # Get raw MIME content
                 Write-Host "  [$counter/$($Messages.Count)] Getting raw message: $($fullMessage.subject)" -ForegroundColor Gray
+                Write-Host "    Source: $($message.SourceFolder)" -ForegroundColor Magenta
                 $rawMessage = Get-EmailContent -AccessToken $AccessToken -UserEmail $UserEmail -MessageId $message.id -GetRawMessage
                 
                 if ($rawMessage) {
@@ -516,6 +624,7 @@ function Download-Emails {
                         ToRecipients = if ($fullMessage.toRecipients) { ($fullMessage.toRecipients | ForEach-Object { $_.emailAddress.address }) -join "; " } else { "" }
                         CcRecipients = if ($fullMessage.ccRecipients) { ($fullMessage.ccRecipients | ForEach-Object { $_.emailAddress.address }) -join "; " } else { "" }
                         BccRecipients = if ($fullMessage.bccRecipients) { ($fullMessage.bccRecipients | ForEach-Object { $_.emailAddress.address }) -join "; " } else { "" }
+                        SourceFolder = $message.SourceFolder
                         FileName = ""  # Will update this below
                     }
                     
@@ -524,7 +633,15 @@ function Download-Emails {
                     # Save raw email as EML file
                     $sanitizedSubject = $fullMessage.subject -replace '[<>:"/\\|?*]', '_'
                     $receivedDate = [DateTime]::Parse($fullMessage.receivedDateTime)
-                    $emlFileName = "$($receivedDate.ToString('yyyyMMdd_HHmmss'))_$($sanitizedSubject.Substring(0, [Math]::Min(50, $sanitizedSubject.Length))).eml"
+                    
+                    # Add folder indicator to filename
+                    $folderPrefix = switch ($message.SourceFolder) {
+                        "RecoverableItemsDeletions (Soft-Deleted)" { "SOFTDEL_" }
+                        "RecoverableItemsPurges (Hard-Deleted)" { "HARDDEL_" }
+                        default { "" }
+                    }
+                    
+                    $emlFileName = "$folderPrefix$($receivedDate.ToString('yyyyMMdd_HHmmss'))_$($sanitizedSubject.Substring(0, [Math]::Min(50, $sanitizedSubject.Length))).eml"
                     $emlPath = Join-Path $OutputDir $emlFileName
                     
                     # Convert MIME to EML
@@ -539,7 +656,7 @@ function Download-Emails {
                     
                     if ($headers.Count -gt 0) {
                         # Save headers
-                        $headersFileName = "$($receivedDate.ToString('yyyyMMdd_HHmmss'))_$($sanitizedSubject.Substring(0, [Math]::Min(30, $sanitizedSubject.Length)))_Headers.txt"
+                        $headersFileName = "$folderPrefix$($receivedDate.ToString('yyyyMMdd_HHmmss'))_$($sanitizedSubject.Substring(0, [Math]::Min(30, $sanitizedSubject.Length)))_Headers.txt"
                         $headersPath = Join-Path $OutputDir $headersFileName
                         
                         $headerOutput = @()
@@ -547,6 +664,7 @@ function Download-Emails {
                         $headerOutput += "EMAIL HEADERS ANALYSIS"
                         $headerOutput += "=" * 60
                         $headerOutput += "File: $emlFileName"
+                        $headerOutput += "Source Folder: $($message.SourceFolder)"
                         $headerOutput += "Extracted: $(Get-Date)"
                         $headerOutput += "=" * 60
                         $headerOutput += ""
@@ -591,7 +709,7 @@ function Download-Emails {
                         
                         if ($attachments) {
                             # Create attachments subfolder
-                            $attachmentDir = Join-Path $OutputDir "Attachments_$($receivedDate.ToString('yyyyMMdd_HHmmss'))"
+                            $attachmentDir = Join-Path $OutputDir "Attachments_$folderPrefix$($receivedDate.ToString('yyyyMMdd_HHmmss'))"
                             if (!(Test-Path $attachmentDir)) {
                                 New-Item -ItemType Directory -Path $attachmentDir -Force | Out-Null
                             }
@@ -641,9 +759,9 @@ function Download-Emails {
     Write-Host "CSV summary: $csvPath" -ForegroundColor White
     Write-Host "EML files saved to: $OutputDir" -ForegroundColor White
     
-    # Display summary table
+    # Display summary table with source folder
     Write-Host "`nEmail Summary:" -ForegroundColor Cyan
-    $results | Format-Table @{Name="Subject";Expression={$_.Subject.Substring(0,[Math]::Min(40,$_.Subject.Length))}}, Sender, ReceivedDateTime, HasAttachments, FileName -AutoSize
+    $results | Format-Table @{Name="Subject";Expression={$_.Subject.Substring(0,[Math]::Min(40,$_.Subject.Length))}}, Sender, ReceivedDateTime, SourceFolder, HasAttachments, FileName -AutoSize
     
     return $results
 }
@@ -656,6 +774,7 @@ try {
     Write-Host "Search mode: $(if ($SearchAllMailboxes) { 'ALL MAILBOXES' } else { $UserPrincipalName })" -ForegroundColor White
     Write-Host "Days back: $DaysBack" -ForegroundColor White
     Write-Host "Max results: $MaxResults" -ForegroundColor White
+    Write-Host "Include Recoverable Items: $(if ($IncludeRecoverableItems) { 'YES (Soft + Hard Deleted)' } else { 'NO (Regular mailbox only)' })" -ForegroundColor White
     Write-Host ""
     
     # Load .NET assembly for URL encoding
@@ -690,7 +809,7 @@ try {
             Write-Progress -Activity "Searching Mailboxes" -Status "[$mailboxCounter/$($mailboxes.Count)] $($mailbox.userPrincipalName)" -PercentComplete (($mailboxCounter / $mailboxes.Count) * 100)
             
             try {
-                $foundEmails = Search-Emails -AccessToken $accessToken -UserEmail $mailbox.userPrincipalName -Subject $SubjectKeyword -Days $DaysBack -Limit $MaxResults
+                $foundEmails = Search-Emails -AccessToken $accessToken -UserEmail $mailbox.userPrincipalName -Subject $SubjectKeyword -Days $DaysBack -Limit $MaxResults -SearchRecoverable $IncludeRecoverableItems
                 
                 if ($foundEmails) {
                     Write-Host "  Found $($foundEmails.Count) emails in $($mailbox.userPrincipalName)" -ForegroundColor Green
@@ -726,7 +845,7 @@ try {
             exit 1
         }
         
-        $foundEmails = Search-Emails -AccessToken $accessToken -UserEmail $UserPrincipalName -Subject $SubjectKeyword -Days $DaysBack -Limit $MaxResults
+        $foundEmails = Search-Emails -AccessToken $accessToken -UserEmail $UserPrincipalName -Subject $SubjectKeyword -Days $DaysBack -Limit $MaxResults -SearchRecoverable $IncludeRecoverableItems
         
         if ($foundEmails) {
             $allResults = Download-Emails -AccessToken $accessToken -Messages $foundEmails -UserEmail $UserPrincipalName -OutputDir $OutputPath
@@ -736,6 +855,15 @@ try {
     if ($allResults.Count -gt 0) {
         Write-Host "`nOperation completed successfully!" -ForegroundColor Green
         Write-Host "Downloaded $($allResults.Count) email(s) with headers and attachments" -ForegroundColor Green
+        
+        # Show breakdown by source folder if recoverable items were included
+        if ($IncludeRecoverableItems) {
+            Write-Host "`nBreakdown by Source:" -ForegroundColor Cyan
+            $sourceFolders = $allResults | Group-Object -Property SourceFolder
+            foreach ($folder in $sourceFolders) {
+                Write-Host "  $($folder.Name): $($folder.Count) email(s)" -ForegroundColor White
+            }
+        }
     } else {
         Write-Host "No emails found matching the search criteria." -ForegroundColor Yellow
     }
